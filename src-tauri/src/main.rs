@@ -54,8 +54,8 @@ fn scan_directory_fast(path: String) -> Result<ScanResult, String> {
             
             // 计算大小
             let size = if is_directory {
-                // 使用并行递归计算目录大小
-                calculate_dir_size_parallel(&entry_path)
+                // 使用 walkdir 计算目录大小（准确可靠）
+                calculate_dir_size_walkdir(&entry_path)
             } else {
                 metadata.len()
             };
@@ -83,35 +83,7 @@ fn scan_directory(path: String) -> Result<ScanResult, String> {
     scan_directory_fast(path)
 }
 
-// 使用 rayon 并行计算目录大小（快速且准确）
-fn calculate_dir_size_parallel(path: &Path) -> u64 {
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
-    
-    let total_size = Arc::new(AtomicU64::new(0));
-    
-    // 递归遍历目录
-    if let Ok(entries) = fs::read_dir(path) {
-        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        
-        entries.par_iter().for_each(|entry| {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    total_size.fetch_add(metadata.len(), Ordering::Relaxed);
-                } else if metadata.is_dir() {
-                    // 递归计算子目录
-                    let sub_size = calculate_dir_size_parallel(&entry.path());
-                    total_size.fetch_add(sub_size, Ordering::Relaxed);
-                }
-            }
-        });
-    }
-    
-    total_size.load(Ordering::Relaxed)
-}
-
-// 使用 walkdir 库计算目录大小（更可靠的回退方案）
+// 使用 walkdir 库计算目录大小（准确可靠）
 fn calculate_dir_size_walkdir(path: &Path) -> u64 {
     use walkdir::WalkDir;
     

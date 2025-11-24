@@ -1,11 +1,18 @@
 # 🔍 空间透视 - 专业的磁盘空间分析工具
 
-> 现代化的磁盘空间管理工具，帮助你快速找到占用空间的大文件和目录
+<div align="center">
 
 ![Version](https://img.shields.io/badge/version-1.3-blue)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Size](https://img.shields.io/badge/size-2.6MB-green)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![Stars](https://img.shields.io/github/stars/cxapython/CleanDir?style=social)
+
+**现代化的磁盘空间管理工具，帮助你快速找到占用空间的大文件和目录**
+
+[特性](#-核心特性) • [安装](#-快速开始) • [使用](#基本操作) • [开发](#-贡献)
+
+</div>
 
 ---
 

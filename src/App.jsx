@@ -12,14 +12,22 @@ function App() {
   const [selectedItems, setSelectedItems] = useState(new Set())
   const [pathHistory, setPathHistory] = useState([])
   const [stats, setStats] = useState({ count: 0, totalSize: 0 })
-  const [scanMode, setScanMode] = useState('fast')
+  const [scanMode, setScanMode] = useState('fast') // 'fast' | 'large' | 'old' | 'duplicate'
   const [viewMode, setViewMode] = useState('bubble') // 'bubble' or 'list'
+  const [specialScanThreshold, setSpecialScanThreshold] = useState(100) // 大文件阈值 (MB) 或 旧文件天数
+  const [showDeleteHistory, setShowDeleteHistory] = useState(false) // 显示删除历史面板
   const [showPermissionGuide, setShowPermissionGuide] = useState(false)
   const [hasFullDiskAccess, setHasFullDiskAccess] = useState(true) // 权限状态
   const [isLoading, setIsLoading] = useState(true) // 初始加载状态
-  const [scanCache, setScanCache] = useState({}) // 扫描结果缓存
+  const [scanCache, setScanCache] = useState({}) // 扫描结果缓存: { path: { items, stats, timestamp } }
   const [progressPercent, setProgressPercent] = useState(0) // 进度百分比
-  const [scanProgress, setScanProgress] = useState({ current: 0, total: 0, currentItem: '' }) // 扫描进度详情
+  const [scanProgress, setScanProgress] = useState({ 
+    current: 0, 
+    total: 0, 
+    currentItem: '', 
+    elapsed_seconds: 0,
+    estimated_remaining_seconds: 0 
+  }) // 扫描进度详情
 
   useEffect(() => {
     // 初始化：设置默认路径并检测权限
@@ -126,10 +134,10 @@ function App() {
         totalSize: result.items.reduce((sum, item) => sum + item.size, 0)
       }
       
-      // 保存当前目录到缓存
+      // 保存当前目录到缓存 (带时间戳)
       setScanCache(prev => ({
         ...prev,
-        [currentPath]: { items: result.items, stats }
+        [currentPath]: { items: result.items, stats, timestamp: Date.now() }
       }))
       
       // ⚡️ 关键优化：后台预缓存前5个最大的子目录
@@ -149,7 +157,7 @@ function App() {
               }
               setScanCache(prev => ({
                 ...prev,
-                [item.path]: { items: subResult.items, stats: subStats }
+                [item.path]: { items: subResult.items, stats: subStats, timestamp: Date.now() }
               }))
               console.log('✅ 预缓存:', item.name)
             } catch (e) {
@@ -196,12 +204,14 @@ function App() {
     
     // 🔥 监听后端真实进度（详细信息）
     const unlisten = await listen('scan-progress', (event) => {
-      const { percent, current, total, current_item } = event.payload
+      const { percent, current, total, current_item, elapsed_seconds, estimated_remaining_seconds } = event.payload
       setProgressPercent(percent || 0)
       setScanProgress({
         current: current || 0,
         total: total || 0,
-        currentItem: current_item || ''
+        currentItem: current_item || '',
+        elapsed_seconds: elapsed_seconds || 0,
+        estimated_remaining_seconds: estimated_remaining_seconds || 0
       })
     })
     
@@ -216,10 +226,10 @@ function App() {
         totalSize: result.items.reduce((sum, item) => sum + item.size, 0)
       }
       
-      // 保存到缓存
+      // 保存到缓存 (带时间戳)
       setScanCache(prev => ({
         ...prev,
-        [item.path]: { items: result.items, stats }
+        [item.path]: { items: result.items, stats, timestamp: Date.now() }
       }))
       
       setItems(result.items)
@@ -263,24 +273,60 @@ function App() {
   const deleteSelected = async () => {
     if (selectedItems.size === 0) return
     
-    const totalSize = Array.from(selectedItems).reduce((sum, path) => {
+    const itemsToDelete = Array.from(selectedItems).map(path => {
       const item = items.find(i => i.path === path)
-      return sum + (item?.size || 0)
+      return item
+    }).filter(Boolean)
+    
+    const totalSize = itemsToDelete.reduce((sum, item) => sum + item.size, 0)
+    const totalCount = itemsToDelete.reduce((sum, item) => {
+      return sum + (item.is_directory ? (item.item_count || 1) : 1)
     }, 0)
     
-    const confirmed = window.confirm(
-      `确定要移到废纸篓吗？\n\n` +
+    // 检查是否有目录
+    const hasDirectory = itemsToDelete.some(item => item.is_directory)
+    
+    let confirmMessage = `确定要移到废纸篓吗？\n\n` +
       `选中项: ${selectedItems.size} 个\n` +
-      `总大小: ${formatBytes(totalSize)}\n\n` +
-      `💡 提示: 文件会移到废纸篓，可以恢复`
-    )
+      `总大小: ${formatBytes(totalSize)}\n`
+    
+    if (hasDirectory) {
+      confirmMessage += `包含文件/目录: ${totalCount} 项\n`
+    }
+    
+    confirmMessage += `\n💡 提示: 文件会移到废纸篓，可以恢复`
+    
+    const confirmed = window.confirm(confirmMessage)
     
     if (!confirmed) return
     
     try {
       const pathsToDelete = Array.from(selectedItems)
       await invoke('delete_items', { paths: pathsToDelete })
-      alert('✅ 已移到废纸篓！\n可以在废纸篓中恢复这些文件。')
+      
+      // 保存删除历史到 localStorage
+      const deleteHistory = JSON.parse(localStorage.getItem('delete-history') || '[]')
+      const timestamp = Date.now()
+      
+      itemsToDelete.forEach(item => {
+        deleteHistory.unshift({
+          path: item.path,
+          name: item.name,
+          size: item.size,
+          is_directory: item.is_directory,
+          deleted_at: timestamp,
+          deleted_at_readable: new Date(timestamp).toLocaleString('zh-CN')
+        })
+      })
+      
+      // 只保留最近 100 条删除记录
+      if (deleteHistory.length > 100) {
+        deleteHistory.splice(100)
+      }
+      
+      localStorage.setItem('delete-history', JSON.stringify(deleteHistory))
+      
+      alert('✅ 已移到废纸篓！\n可以在废纸篓中恢复这些文件。\n\n删除历史已保存，可在"删除历史"中查看。')
       setSelectedItems(new Set())
       startScan()
     } catch (error) {
@@ -303,17 +349,103 @@ function App() {
     return Math.max(minSize, ratio * maxBubbleSize)
   }
 
-  const getDisplayName = (name) => {
-    if (name.length > 12) {
-      return name.substring(0, 10) + '...'
+  const getDisplayName = (name, maxLength = 15) => {
+    if (name.length > maxLength) {
+      // 智能截断：保留扩展名
+      const parts = name.split('.')
+      if (parts.length > 1) {
+        const ext = parts.pop()
+        const basename = parts.join('.')
+        const availableLength = maxLength - ext.length - 4 // 减去 "..." 和 "."
+        if (availableLength > 0 && basename.length > availableLength) {
+          return basename.substring(0, availableLength) + '...' + ext
+        }
+      }
+      return name.substring(0, maxLength - 3) + '...'
     }
     return name
   }
 
   const maxSize = items.length > 0 ? Math.max(...items.map(i => i.size)) : 1
 
+  // 获取删除历史
+  const getDeleteHistory = () => {
+    return JSON.parse(localStorage.getItem('delete-history') || '[]')
+  }
+
+  // 清空删除历史
+  const clearDeleteHistory = () => {
+    if (window.confirm('确定要清空删除历史吗？\n\n注意: 这不会影响废纸篓中的文件，只是清除历史记录。')) {
+      localStorage.removeItem('delete-history')
+      setShowDeleteHistory(false)
+      alert('✅ 删除历史已清空')
+    }
+  }
+
   return (
     <>
+      {/* 删除历史面板 */}
+      {showDeleteHistory && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-gradient-to-br from-[#2D1B4E] to-[#1A0B2E] rounded-2xl p-6 max-w-3xl w-full max-h-[80vh] overflow-hidden flex flex-col border border-purple-500/30">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-white text-2xl font-bold">🗑️ 删除历史</h2>
+              <div className="flex gap-2">
+                <button
+                  onClick={clearDeleteHistory}
+                  className="px-4 py-2 bg-red-600/80 hover:bg-red-600 rounded-lg text-white text-sm font-semibold transition-colors"
+                >
+                  清空历史
+                </button>
+                <button
+                  onClick={() => setShowDeleteHistory(false)}
+                  className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-white text-sm font-semibold transition-colors"
+                >
+                  关闭
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto">
+              {getDeleteHistory().length === 0 ? (
+                <div className="text-center py-12">
+                  <p className="text-gray-400 text-lg">暂无删除记录</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {getDeleteHistory().map((record, index) => (
+                    <div
+                      key={index}
+                      className="bg-white/5 rounded-lg p-4 hover:bg-white/10 transition-colors"
+                    >
+                      <div className="flex items-start justify-between">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="text-lg">{record.is_directory ? '📁' : '📄'}</span>
+                            <span className="text-white font-semibold">{record.name}</span>
+                          </div>
+                          <p className="text-gray-400 text-xs font-mono mb-1">{record.path}</p>
+                          <div className="flex items-center gap-4 text-xs text-gray-400">
+                            <span>大小: {formatBytes(record.size)}</span>
+                            <span>删除时间: {record.deleted_at_readable}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="mt-4 text-center">
+              <p className="text-gray-400 text-sm">
+                💡 提示: 文件在废纸篓中，可以通过 Finder 恢复
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 初始加载动画 */}
       {isLoading && (
         <div className="fixed inset-0 bg-gradient-to-br from-[#1A0B2E] via-[#2D1B4E] to-[#1A0B2E] flex items-center justify-center z-50">
@@ -407,6 +539,81 @@ function App() {
             <span className="text-white font-mono text-xs">{currentPath}</span>
           </div>
 
+          {/* 扫描模式选择 */}
+          <div className="mb-3">
+            <label className="text-gray-400 text-xs mb-2 block">
+              扫描模式 
+              {scanMode !== 'fast' && (
+                <span className="ml-2 text-purple-400">
+                  (当前: {
+                    scanMode === 'large' ? '大文件' : 
+                    scanMode === 'old' ? '旧文件' : 
+                    '重复文件'
+                  })
+                </span>
+              )}
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => setScanMode('fast')}
+                className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                  scanMode === 'fast' 
+                    ? 'bg-purple-600 text-white' 
+                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
+                }`}
+              >
+                ⚡ 快速扫描
+              </button>
+              <button
+                onClick={() => setScanMode('large')}
+                className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                  scanMode === 'large' 
+                    ? 'bg-purple-600 text-white' 
+                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
+                }`}
+              >
+                📦 大文件
+              </button>
+              <button
+                onClick={() => setScanMode('old')}
+                className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                  scanMode === 'old' 
+                    ? 'bg-purple-600 text-white' 
+                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
+                }`}
+              >
+                📅 旧文件
+              </button>
+              <button
+                onClick={() => setScanMode('duplicate')}
+                className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                  scanMode === 'duplicate' 
+                    ? 'bg-purple-600 text-white' 
+                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
+                }`}
+              >
+                🔄 重复文件
+              </button>
+            </div>
+            
+            {/* 阈值设置 */}
+            {(scanMode === 'large' || scanMode === 'old') && (
+              <div className="mt-2">
+                <label className="text-gray-400 text-xs block mb-1">
+                  {scanMode === 'large' ? '最小文件大小 (MB)' : '未修改天数'}
+                </label>
+                <input
+                  type="number"
+                  value={specialScanThreshold}
+                  onChange={(e) => setSpecialScanThreshold(Number(e.target.value))}
+                  className="w-full px-3 py-1.5 bg-white/5 border border-white/10 rounded-lg text-white text-sm"
+                  min={scanMode === 'large' ? 1 : 1}
+                  max={scanMode === 'large' ? 10000 : 365}
+                />
+              </div>
+            )}
+          </div>
+
           {/* 目录信息卡片 */}
           <div className="bg-gradient-to-br from-purple-900/30 to-purple-800/20 rounded-2xl p-5 backdrop-blur-sm border border-purple-500/20">
             <div className="flex items-center gap-3 mb-3">
@@ -428,7 +635,7 @@ function App() {
 
         {/* 文件列表 */}
         <div className="flex-1 overflow-y-auto px-3">
-          {items.slice(0, 10).map((item, index) => {
+          {[...items].sort((a, b) => b.size - a.size).slice(0, 10).map((item, index) => {
             const isSelected = selectedItems.has(item.path)
             return (
               <div
@@ -440,7 +647,9 @@ function App() {
                 onDoubleClick={() => enterDirectory(item)}
               >
                 <div className="w-8 h-8 flex items-center justify-center">
-                  {isSelected ? (
+                  {item.error ? (
+                    <span className="text-lg" title={item.error}>⚠️</span>
+                  ) : isSelected ? (
                     <span className="text-lg">ℹ️</span>
                   ) : (
                     <span className="text-lg">{item.is_directory ? '📁' : '📄'}</span>
@@ -450,9 +659,14 @@ function App() {
                   <div className="text-white text-sm font-medium truncate">
                     {item.name}
                   </div>
+                  {item.error && (
+                    <div className="text-red-400 text-xs mt-0.5">
+                      {item.error}
+                    </div>
+                  )}
                 </div>
                 <div className="text-right">
-                  <div className="text-white text-sm font-bold">
+                  <div className={`text-sm font-bold ${item.error ? 'text-gray-500' : 'text-white'}`}>
                     {formatBytes(item.size)}
                   </div>
                 </div>
@@ -509,7 +723,12 @@ function App() {
               disabled={isScanning || !currentPath}
               className="flex-1 px-3 py-2 bg-purple-600/80 hover:bg-purple-600 rounded-lg text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
-              {isScanning ? '扫描中...' : '🔄 扫描'}
+              {isScanning ? '扫描中...' : (
+                scanMode === 'fast' ? '🔄 扫描' :
+                scanMode === 'large' ? '📦 扫大文件' :
+                scanMode === 'old' ? '📅 扫旧文件' :
+                '🔄 扫重复'
+              )}
             </button>
             <button
               onClick={deleteSelected}
@@ -547,6 +766,11 @@ function App() {
                   ? `已扫描 ${scanProgress.current} / ${scanProgress.total} 项` 
                   : '正在准备...'}
               </p>
+              {scanProgress.estimated_remaining_seconds > 0 && (
+                <p className="text-purple-300 text-sm mb-2">
+                  ⏱️ 预计剩余: {Math.floor(scanProgress.estimated_remaining_seconds / 60)}分{scanProgress.estimated_remaining_seconds % 60}秒
+                </p>
+              )}
               
               {/* 进度条 */}
               <div className="w-full bg-white/10 rounded-full h-3 mb-2 overflow-hidden">
@@ -605,18 +829,23 @@ function App() {
                     onClick={() => toggleSelection(item.path)}
                     onDoubleClick={() => enterDirectory(item)}
                   >
-                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center transition-all ${
+                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center gap-1 transition-all ${
                       isSelected 
                         ? 'bg-gradient-to-br from-pink-500/40 to-purple-600/40 ring-4 ring-pink-500/50' 
                         : 'bg-gradient-to-br from-pink-500/30 to-purple-600/30'
-                    } backdrop-blur-md border border-white/10 shadow-2xl`}>
-                      <div className="text-4xl mb-2">
+                    } backdrop-blur-md border border-white/10 shadow-2xl overflow-hidden`} style={{padding: '12%'}}>
+                      <div className="text-5xl flex-shrink-0 mb-1">
                         {item.is_directory ? '📁' : '📄'}
                       </div>
-                      <div className="text-white font-bold text-center px-4">
-                        {getDisplayName(item.name)}
+                      <div className="text-white font-bold text-center text-base leading-tight w-full overflow-hidden px-2" style={{
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        wordBreak: 'break-word'
+                      }}>
+                        {getDisplayName(item.name, 18)}
                       </div>
-                      <div className="text-white text-lg font-bold mt-1">
+                      <div className="text-white/90 text-lg font-bold mt-1 flex-shrink-0">
                         {formatBytes(item.size)}
                       </div>
                     </div>
@@ -651,18 +880,23 @@ function App() {
                     onClick={() => toggleSelection(item.path)}
                     onDoubleClick={() => enterDirectory(item)}
                   >
-                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center ${
+                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center gap-0.5 ${
                       isSelected
                         ? 'bg-gradient-to-br from-purple-500/40 to-blue-500/40 ring-2 ring-purple-500/50'
                         : 'bg-gradient-to-br from-purple-500/25 to-blue-500/25'
-                    } backdrop-blur-sm border border-white/10 shadow-xl`}>
-                      <div className="text-2xl mb-1">
+                    } backdrop-blur-sm border border-white/10 shadow-xl overflow-hidden`} style={{padding: '10%'}}>
+                      <div className="text-2xl flex-shrink-0">
                         {item.is_directory ? '📁' : '📄'}
                       </div>
-                      <div className="text-white text-xs font-bold text-center px-2">
-                        {getDisplayName(item.name)}
+                      <div className="text-white text-xs font-bold text-center leading-tight w-full overflow-hidden" style={{
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        wordBreak: 'break-word'
+                      }}>
+                        {getDisplayName(item.name, 12)}
                       </div>
-                      <div className="text-white text-sm font-bold mt-0.5">
+                      <div className="text-white/90 text-xs font-bold flex-shrink-0">
                         {formatBytes(item.size)}
                       </div>
                     </div>
@@ -693,12 +927,15 @@ function App() {
                     onClick={() => toggleSelection(item.path)}
                     onDoubleClick={() => enterDirectory(item)}
                   >
-                    <div className={`w-full h-full rounded-full flex items-center justify-center ${
-                      isSelected
-                        ? 'bg-purple-500/40 ring-1 ring-purple-500/50'
-                        : 'bg-purple-500/20'
-                    } backdrop-blur-sm border border-white/10 shadow-lg`}>
-                      <div className="text-lg">
+                    <div 
+                      className={`w-full h-full rounded-full flex items-center justify-center ${
+                        isSelected
+                          ? 'bg-purple-500/40 ring-1 ring-purple-500/50'
+                          : 'bg-purple-500/20'
+                      } backdrop-blur-sm border border-white/10 shadow-lg`}
+                      title={`${item.name}\n${formatBytes(item.size)}`}
+                    >
+                      <div className="text-2xl">
                         {item.is_directory ? '📁' : '📄'}
                       </div>
                     </div>
@@ -711,14 +948,23 @@ function App() {
 
       </div>
 
-      {/* 顶部帮助按钮 */}
-      <button
-        onClick={() => setShowPermissionGuide(true)}
-        className="fixed top-5 right-5 w-10 h-10 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white text-xl transition-colors z-40"
-        title="权限设置帮助"
-      >
-        ?
-      </button>
+      {/* 顶部按钮组 */}
+      <div className="fixed top-5 right-5 flex gap-2 z-40">
+        <button
+          onClick={() => setShowDeleteHistory(true)}
+          className="w-10 h-10 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white text-lg transition-colors"
+          title="查看删除历史"
+        >
+          🗑️
+        </button>
+        <button
+          onClick={() => setShowPermissionGuide(true)}
+          className="w-10 h-10 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white text-xl transition-colors"
+          title="权限设置帮助"
+        >
+          ?
+        </button>
+      </div>
       </div>
     </div>
     </>

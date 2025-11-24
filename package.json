@@ -1,6 +1,6 @@
 {
   "name": "space-visualizer",
-  "version": "1.0.0",
+  "version": "1.4.0",
   "description": "空间透视 - 磁盘空间分析工具",
   "type": "module",
   "scripts": {

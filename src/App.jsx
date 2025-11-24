@@ -782,7 +782,7 @@ function App() {
 
               {/* 次要的小气泡（4-8个） */}
               {items.slice(3, 8).map((item, index) => {
-                const size = getBubbleSize(item.size, maxSize) * 0.6
+                const size = Math.max(getBubbleSize(item.size, maxSize) * 0.6, 100)
                 const positions = [
                   { x: '15%', y: '20%' },
                   { x: '80%', y: '20%' },
@@ -796,7 +796,7 @@ function App() {
                 return (
                   <div
                     key={item.path}
-                    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all hover:scale-110"
+                    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all hover:scale-110 group"
                     style={{
                       left: pos.x,
                       top: pos.y,
@@ -806,25 +806,26 @@ function App() {
                     }}
                     onClick={() => toggleSelection(item.path)}
                     onDoubleClick={() => enterDirectory(item)}
+                    title={`${item.name}\n${formatBytes(item.size)}`}
                   >
-                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center gap-1 ${
+                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center ${
                       isSelected
                         ? 'bg-gradient-to-br from-purple-500/40 to-blue-500/40 ring-2 ring-purple-500/50'
                         : 'bg-gradient-to-br from-purple-500/25 to-blue-500/25'
-                    } backdrop-blur-sm border border-white/10 shadow-xl p-4`}>
-                      <div className="text-3xl flex-shrink-0 mb-1">
+                    } backdrop-blur-sm border border-white/10 shadow-xl p-2 gap-0.5`}>
+                      <div className="text-2xl flex-shrink-0">
                         {item.is_directory ? '📁' : '📄'}
                       </div>
-                      <div className="text-white text-sm font-bold text-center leading-tight w-full" style={{
+                      <div className="text-white text-xs font-bold text-center leading-tight w-full px-1" style={{
                         display: '-webkit-box',
                         WebkitLineClamp: 2,
                         WebkitBoxOrient: 'vertical',
                         wordBreak: 'break-word',
                         overflow: 'hidden'
                       }}>
-                        {getDisplayName(item.name, 15)}
+                        {getDisplayName(item.name, 12)}
                       </div>
-                      <div className="text-white/90 text-sm font-bold flex-shrink-0 mt-1">
+                      <div className="text-white/90 text-[11px] font-bold flex-shrink-0">
                         {formatBytes(item.size)}
                       </div>
                     </div>
@@ -832,9 +833,9 @@ function App() {
                 )
               })}
 
-              {/* 更小的气泡（其余的） */}
+              {/* 更小的气泡（其余的） - 只显示图标和大小 */}
               {items.slice(8, 15).map((item, index) => {
-                const size = 60
+                const size = 70
                 const angle = (index / 7) * 2 * Math.PI
                 const radius = 200
                 const x = 50 + Math.cos(angle) * 35
@@ -844,7 +845,7 @@ function App() {
                 return (
                   <div
                     key={item.path}
-                    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all hover:scale-125"
+                    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all hover:scale-125 group"
                     style={{
                       left: `${x}%`,
                       top: `${y}%`,
@@ -854,26 +855,26 @@ function App() {
                     }}
                     onClick={() => toggleSelection(item.path)}
                     onDoubleClick={() => enterDirectory(item)}
+                    title={`${item.name}\n${formatBytes(item.size)}`}
                   >
                     <div 
-                      className={`w-full h-full rounded-full flex flex-col items-center justify-center gap-0.5 p-2 ${
+                      className={`w-full h-full rounded-full flex flex-col items-center justify-center gap-1 p-2 ${
                         isSelected
                           ? 'bg-purple-500/40 ring-1 ring-purple-500/50'
                           : 'bg-purple-500/20'
-                      } backdrop-blur-sm border border-white/10 shadow-lg`}
-                      title={`${item.name}\n${formatBytes(item.size)}`}
+                      } backdrop-blur-sm border border-white/10 shadow-lg relative`}
                     >
-                      <div className="text-xl flex-shrink-0">
+                      {/* 图标 */}
+                      <div className="text-2xl flex-shrink-0">
                         {item.is_directory ? '📁' : '📄'}
                       </div>
-                      <div className="text-white text-[10px] font-bold text-center leading-tight" style={{
-                        display: '-webkit-box',
-                        WebkitLineClamp: 1,
-                        WebkitBoxOrient: 'vertical',
-                        wordBreak: 'break-word',
-                        overflow: 'hidden'
-                      }}>
-                        {getDisplayName(item.name, 8)}
+                      {/* 大小 */}
+                      <div className="text-white text-[10px] font-bold leading-none">
+                        {formatBytes(item.size)}
+                      </div>
+                      {/* Hover 显示完整名称 */}
+                      <div className="absolute -bottom-8 left-1/2 transform -translate-x-1/2 bg-black/90 text-white text-[10px] px-2 py-1 rounded whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50">
+                        {item.name}
                       </div>
                     </div>
                   </div>

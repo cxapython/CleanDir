@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build outputs
+dist/
+target/
+src-tauri/target/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Rust
+Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Tauri
+src-tauri/target/
+
+# Distribution
+*.dmg
+*.exe
+*.AppImage
+*.deb
+*.rpm
+
+# Cursor
+.cursor/

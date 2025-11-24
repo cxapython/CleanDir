@@ -1,0 +1,729 @@
+import { useState, useEffect } from 'react'
+import { invoke } from '@tauri-apps/api/tauri'
+import { open } from '@tauri-apps/api/dialog'
+import { homeDir } from '@tauri-apps/api/path'
+import { listen } from '@tauri-apps/api/event'
+import PermissionGuide from './PermissionGuide'
+
+function App() {
+  const [currentPath, setCurrentPath] = useState('')
+  const [items, setItems] = useState([])
+  const [isScanning, setIsScanning] = useState(false)
+  const [selectedItems, setSelectedItems] = useState(new Set())
+  const [pathHistory, setPathHistory] = useState([])
+  const [stats, setStats] = useState({ count: 0, totalSize: 0 })
+  const [scanMode, setScanMode] = useState('fast')
+  const [viewMode, setViewMode] = useState('bubble') // 'bubble' or 'list'
+  const [showPermissionGuide, setShowPermissionGuide] = useState(false)
+  const [hasFullDiskAccess, setHasFullDiskAccess] = useState(true) // 权限状态
+  const [isLoading, setIsLoading] = useState(true) // 初始加载状态
+  const [scanCache, setScanCache] = useState({}) // 扫描结果缓存
+  const [progressPercent, setProgressPercent] = useState(0) // 进度百分比
+  const [scanProgress, setScanProgress] = useState({ current: 0, total: 0, currentItem: '' }) // 扫描进度详情
+
+  useEffect(() => {
+    // 初始化：设置默认路径并检测权限
+    const initialize = async () => {
+      // 默认扫描 /Users 目录
+      setCurrentPath('/Users')
+      
+      // 检测磁盘访问权限（添加超时保护）
+      try {
+        // 使用 Promise.race 添加超时机制
+        const checkPermission = invoke('check_disk_access_permission')
+        const timeout = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('超时')), 3000)
+        )
+        
+        const hasPermission = await Promise.race([checkPermission, timeout])
+          .catch(() => false)  // 超时或错误，假设没有权限
+        
+        setHasFullDiskAccess(hasPermission)
+        setIsLoading(false) // 加载完成
+        
+        if (!hasPermission) {
+          // 没有权限，延迟显示引导
+          setTimeout(() => {
+            setShowPermissionGuide(true)
+          }, 1500)
+        } else {
+          // 有权限，检查是否是首次使用
+          const hasShownGuide = localStorage.getItem('permission-guide-shown')
+          if (!hasShownGuide) {
+            // 首次使用，简单提示一下
+            console.log('✅ 已检测到完全磁盘访问权限')
+            localStorage.setItem('permission-guide-shown', 'true')
+          }
+        }
+      } catch (error) {
+        console.error('权限检测失败:', error)
+        setHasFullDiskAccess(false)
+        setIsLoading(false)
+        // 即使失败也显示引导
+        setTimeout(() => {
+          setShowPermissionGuide(true)
+        }, 1500)
+      }
+    }
+    
+    initialize()
+  }, [])
+
+  const selectDirectory = async () => {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: currentPath,
+    })
+    
+    if (selected) {
+      setCurrentPath(selected)
+      setPathHistory([])
+    }
+  }
+
+  const startScan = async (mode = scanMode, forceRefresh = false) => {
+    if (!currentPath) return
+    
+    // 检查缓存（除非强制刷新）
+    if (!forceRefresh && scanCache[currentPath]) {
+      console.log('✅ 从缓存加载:', currentPath)
+      const cached = scanCache[currentPath]
+      setItems(cached.items)
+      setStats(cached.stats)
+      return
+    }
+    
+    // 立即更新 UI 状态
+    setIsScanning(true)
+    setItems([])
+    setSelectedItems(new Set())
+    setProgressPercent(0)
+    
+    // 使用 setTimeout 确保状态更新完成并渲染后再执行扫描
+    await new Promise(resolve => setTimeout(resolve, 50))
+    
+    // 🔥 监听后端真实进度（详细信息）
+    const unlisten = await listen('scan-progress', (event) => {
+      const { percent, current, total, current_item } = event.payload
+      setProgressPercent(percent || 0)
+      setScanProgress({
+        current: current || 0,
+        total: total || 0,
+        currentItem: current_item || ''
+      })
+    })
+    
+    try {
+      const command = mode === 'fast' ? 'scan_directory_fast' : 'scan_directory'
+      const result = await invoke(command, { path: currentPath })
+      
+      // 确保显示 100%
+      setProgressPercent(100)
+      
+      const stats = {
+        count: result.items.length,
+        totalSize: result.items.reduce((sum, item) => sum + item.size, 0)
+      }
+      
+      // 保存当前目录到缓存
+      setScanCache(prev => ({
+        ...prev,
+        [currentPath]: { items: result.items, stats }
+      }))
+      
+      // ⚡️ 关键优化：后台预缓存前5个最大的子目录
+      // 这样点击进入时就能立即显示！
+      setTimeout(async () => {
+        const topDirs = result.items
+          .filter(item => item.is_directory)
+          .slice(0, 5) // 只缓存前5个
+        
+        for (const item of topDirs) {
+          if (!scanCache[item.path]) {
+            try {
+              const subResult = await invoke(command, { path: item.path })
+              const subStats = {
+                count: subResult.items.length,
+                totalSize: subResult.items.reduce((sum, i) => sum + i.size, 0)
+              }
+              setScanCache(prev => ({
+                ...prev,
+                [item.path]: { items: subResult.items, stats: subStats }
+              }))
+              console.log('✅ 预缓存:', item.name)
+            } catch (e) {
+              // 静默失败
+            }
+          }
+        }
+      }, 100)
+      
+      setItems(result.items)
+      setStats(stats)
+    } catch (error) {
+      console.error('扫描失败:', error)
+      alert('扫描失败: ' + error)
+    } finally {
+      unlisten()  // 清理监听器
+      setIsScanning(false)
+      setProgressPercent(0)
+    }
+  }
+
+  const enterDirectory = async (item) => {
+    if (!item.is_directory) return
+    
+    // 保存当前状态到历史
+    setPathHistory([...pathHistory, currentPath])
+    setCurrentPath(item.path)
+    
+    // 检查缓存
+    if (scanCache[item.path]) {
+      console.log('⚡️ 立即从缓存显示:', item.path)
+      const cached = scanCache[item.path]
+      setItems(cached.items)
+      setStats(cached.stats)
+      return
+    }
+    
+    // 没有缓存，需要扫描
+    setIsScanning(true)
+    setProgressPercent(0)
+    
+    // 使用 setTimeout 确保 UI 先渲染
+    await new Promise(resolve => setTimeout(resolve, 50))
+    
+    // 🔥 监听后端真实进度（详细信息）
+    const unlisten = await listen('scan-progress', (event) => {
+      const { percent, current, total, current_item } = event.payload
+      setProgressPercent(percent || 0)
+      setScanProgress({
+        current: current || 0,
+        total: total || 0,
+        currentItem: current_item || ''
+      })
+    })
+    
+    try {
+      const command = scanMode === 'fast' ? 'scan_directory_fast' : 'scan_directory'
+      const result = await invoke(command, { path: item.path })
+      
+      setProgressPercent(100)
+      
+      const stats = {
+        count: result.items.length,
+        totalSize: result.items.reduce((sum, item) => sum + item.size, 0)
+      }
+      
+      // 保存到缓存
+      setScanCache(prev => ({
+        ...prev,
+        [item.path]: { items: result.items, stats }
+      }))
+      
+      setItems(result.items)
+      setStats(stats)
+    } catch (error) {
+      console.error('扫描失败:', error)
+    } finally {
+      unlisten()  // 清理监听器
+      setIsScanning(false)
+      setProgressPercent(0)
+    }
+  }
+
+  const goBack = () => {
+    if (pathHistory.length === 0) return
+    
+    const newHistory = [...pathHistory]
+    const lastPath = newHistory.pop()
+    setPathHistory(newHistory)
+    setCurrentPath(lastPath)
+    
+    // 从缓存立即加载（后退必然有缓存）
+    if (scanCache[lastPath]) {
+      console.log('⚡️ 后退立即显示:', lastPath)
+      const cached = scanCache[lastPath]
+      setItems(cached.items)
+      setStats(cached.stats)
+    }
+  }
+
+  const toggleSelection = (itemPath) => {
+    const newSelected = new Set(selectedItems)
+    if (newSelected.has(itemPath)) {
+      newSelected.delete(itemPath)
+    } else {
+      newSelected.add(itemPath)
+    }
+    setSelectedItems(newSelected)
+  }
+
+  const deleteSelected = async () => {
+    if (selectedItems.size === 0) return
+    
+    const totalSize = Array.from(selectedItems).reduce((sum, path) => {
+      const item = items.find(i => i.path === path)
+      return sum + (item?.size || 0)
+    }, 0)
+    
+    const confirmed = window.confirm(
+      `确定要移到废纸篓吗？\n\n` +
+      `选中项: ${selectedItems.size} 个\n` +
+      `总大小: ${formatBytes(totalSize)}\n\n` +
+      `💡 提示: 文件会移到废纸篓，可以恢复`
+    )
+    
+    if (!confirmed) return
+    
+    try {
+      const pathsToDelete = Array.from(selectedItems)
+      await invoke('delete_items', { paths: pathsToDelete })
+      alert('✅ 已移到废纸篓！\n可以在废纸篓中恢复这些文件。')
+      setSelectedItems(new Set())
+      startScan()
+    } catch (error) {
+      alert('❌ 移到废纸篓失败:\n' + error)
+    }
+  }
+
+  const formatBytes = (bytes) => {
+    if (bytes === 0) return '0 B'
+    const k = 1024
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return Math.round(bytes / Math.pow(k, i) * 10) / 10 + ' ' + sizes[i]
+  }
+
+  const getBubbleSize = (size, maxSize) => {
+    const minSize = 80
+    const maxBubbleSize = 300
+    const ratio = Math.sqrt(size / maxSize)
+    return Math.max(minSize, ratio * maxBubbleSize)
+  }
+
+  const getDisplayName = (name) => {
+    if (name.length > 12) {
+      return name.substring(0, 10) + '...'
+    }
+    return name
+  }
+
+  const maxSize = items.length > 0 ? Math.max(...items.map(i => i.size)) : 1
+
+  return (
+    <>
+      {/* 初始加载动画 */}
+      {isLoading && (
+        <div className="fixed inset-0 bg-gradient-to-br from-[#1A0B2E] via-[#2D1B4E] to-[#1A0B2E] flex items-center justify-center z-50">
+          <div className="text-center">
+            <div className="relative w-24 h-24 mx-auto mb-6">
+              <div className="absolute inset-0 rounded-full border-4 border-purple-500/30"></div>
+              <div className="absolute inset-0 rounded-full border-4 border-transparent border-t-purple-500 animate-spin"></div>
+              <div className="absolute inset-2 rounded-full border-4 border-transparent border-t-pink-500 animate-spin" style={{animationDirection: 'reverse', animationDuration: '1s'}}></div>
+            </div>
+            <h2 className="text-white text-2xl font-bold mb-2">空间透视</h2>
+            <p className="text-gray-400">正在启动...</p>
+          </div>
+        </div>
+      )}
+
+      {/* 权限引导弹窗 */}
+      {showPermissionGuide && (
+        <PermissionGuide onClose={() => setShowPermissionGuide(false)} />
+      )}
+
+      <div className="h-screen flex flex-col bg-gradient-to-br from-[#1A0B2E] via-[#2D1B4E] to-[#1A0B2E]">
+        {/* 权限警告横幅 */}
+        {!hasFullDiskAccess && (
+          <div className="bg-gradient-to-r from-yellow-600 to-orange-600 px-4 py-2.5 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <span className="text-xl">⚠️</span>
+              <div>
+                <p className="text-white font-semibold text-sm">权限不足：无法准确统计目录大小</p>
+                <p className="text-white/80 text-xs">当前显示的大小可能不完整，建议授予完全磁盘访问权限</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setShowPermissionGuide(true)}
+              className="px-4 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-white text-sm font-semibold transition-colors"
+            >
+              查看教程
+            </button>
+          </div>
+        )}
+
+        <div className="flex flex-1">
+        {/* 左侧列表面板 */}
+      <div className="w-[480px] flex flex-col border-r border-white/10 bg-black/20">
+        {/* 顶部 */}
+        <div className="p-5 border-b border-white/10">
+          <div className="flex items-center gap-2 mb-4">
+            <button
+              onClick={goBack}
+              disabled={pathHistory.length === 0}
+              className="w-10 h-10 rounded-full bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center transition-colors"
+            >
+              <span className="text-xl">←</span>
+            </button>
+            <button
+              onClick={() => setPathHistory([])}
+              className="w-10 h-10 rounded-full bg-white/5 hover:bg-white/10 disabled:opacity-30 flex items-center justify-center transition-colors"
+            >
+              <span className="text-xl">→</span>
+            </button>
+          </div>
+
+          {/* 快捷目录 */}
+          <div className="flex items-center gap-2 mb-3">
+            <button
+              onClick={() => { setCurrentPath('/'); setPathHistory([]) }}
+              className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-gray-300 hover:text-white transition-colors"
+            >
+              💾 根目录
+            </button>
+            <button
+              onClick={() => { setCurrentPath('/Users'); setPathHistory([]) }}
+              className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-gray-300 hover:text-white transition-colors"
+            >
+              👥 Users
+            </button>
+            <button
+              onClick={async () => { 
+                const home = await homeDir()
+                setCurrentPath(home)
+                setPathHistory([])
+              }}
+              className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-gray-300 hover:text-white transition-colors"
+            >
+              🏠 我的
+            </button>
+          </div>
+
+          {/* 面包屑 */}
+          <div className="flex items-center gap-2 text-sm text-gray-400 mb-3">
+            <span>📍</span>
+            <span className="text-white font-mono text-xs">{currentPath}</span>
+          </div>
+
+          {/* 目录信息卡片 */}
+          <div className="bg-gradient-to-br from-purple-900/30 to-purple-800/20 rounded-2xl p-5 backdrop-blur-sm border border-purple-500/20">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-12 h-12 bg-blue-400/20 rounded-xl flex items-center justify-center">
+                <span className="text-2xl">💾</span>
+              </div>
+              <div className="flex-1">
+                <h2 className="text-white font-bold text-lg">
+                  {currentPath.split('/').pop() || 'Macintosh HD'}
+                </h2>
+                <p className="text-sm text-gray-400">
+                  {formatBytes(stats.totalSize)} | {stats.count} 项
+                </p>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        {/* 文件列表 */}
+        <div className="flex-1 overflow-y-auto px-3">
+          {items.slice(0, 10).map((item, index) => {
+            const isSelected = selectedItems.has(item.path)
+            return (
+              <div
+                key={item.path}
+                className={`flex items-center gap-3 p-3 my-1 rounded-xl cursor-pointer transition-all hover:bg-white/5 ${
+                  isSelected ? 'bg-purple-500/20' : ''
+                }`}
+                onClick={() => toggleSelection(item.path)}
+                onDoubleClick={() => enterDirectory(item)}
+              >
+                <div className="w-8 h-8 flex items-center justify-center">
+                  {isSelected ? (
+                    <span className="text-lg">ℹ️</span>
+                  ) : (
+                    <span className="text-lg">{item.is_directory ? '📁' : '📄'}</span>
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-white text-sm font-medium truncate">
+                    {item.name}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-white text-sm font-bold">
+                    {formatBytes(item.size)}
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+
+        {/* 底部状态和操作 */}
+        <div className="border-t border-white/10 bg-black/20">
+          {/* 状态信息 */}
+          <div className="p-4">
+            <div className="flex items-center justify-between text-sm mb-3">
+              <span className="text-gray-400">
+                已用空间: {formatBytes(stats.totalSize)} (共 494 GB)
+              </span>
+              <div className="flex items-center gap-2">
+                <span className="text-gray-400">ℹ️</span>
+                <span className="text-white font-bold">已勾选 {selectedItems.size} 项</span>
+                <span className="text-gray-400">|</span>
+                <span className="text-white font-bold">{formatBytes(
+                  Array.from(selectedItems).reduce((sum, path) => {
+                    const item = items.find(i => i.path === path)
+                    return sum + (item?.size || 0)
+                  }, 0)
+                )}</span>
+              </div>
+            </div>
+            <div className="h-2 bg-white/10 rounded-full overflow-hidden">
+              <div 
+                className="h-full bg-gradient-to-r from-pink-500 to-orange-500"
+                style={{ width: `${(stats.totalSize / (494 * 1024 * 1024 * 1024)) * 100}%` }}
+              ></div>
+            </div>
+          </div>
+          
+          {/* 操作按钮 */}
+          <div className="p-4 pt-0 flex gap-2">
+            <button
+              onClick={selectDirectory}
+              className="flex-1 px-3 py-2 bg-purple-600/80 hover:bg-purple-600 rounded-lg text-white text-sm font-semibold transition-colors"
+            >
+              📁 选择目录
+            </button>
+            <button
+              onClick={() => {
+                setScanCache(prev => {
+                  const newCache = { ...prev }
+                  delete newCache[currentPath]
+                  return newCache
+                })
+                startScan(scanMode, true)
+              }}
+              disabled={isScanning || !currentPath}
+              className="flex-1 px-3 py-2 bg-purple-600/80 hover:bg-purple-600 rounded-lg text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              {isScanning ? '扫描中...' : '🔄 扫描'}
+            </button>
+            <button
+              onClick={deleteSelected}
+              disabled={selectedItems.size === 0}
+              className="flex-1 px-3 py-2 bg-gradient-to-r from-pink-500 to-orange-500 hover:opacity-90 rounded-lg text-white text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed transition-opacity"
+            >
+              🗑️ 删除 ({selectedItems.size})
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* 右侧气泡可视化 */}
+      <div className="flex-1 flex flex-col">
+        {/* 顶部标题 */}
+        <div className="p-5 text-center">
+          <h1 className="text-white text-2xl font-bold">空间透视</h1>
+        </div>
+
+        {/* 气泡区域 */}
+        <div className="flex-1 relative overflow-hidden flex items-center justify-center p-8">
+          {isScanning ? (
+            <div className="text-center max-w-md mx-auto">
+              <div className="relative w-32 h-32 mx-auto mb-6">
+                <div className="absolute inset-0 rounded-full border-4 border-purple-500/30"></div>
+                <div className="absolute inset-0 rounded-full border-4 border-transparent border-t-purple-500 border-r-pink-500 animate-spin"></div>
+                <div className="absolute inset-4 rounded-full border-4 border-transparent border-t-pink-500 border-r-orange-500 animate-spin" style={{animationDirection: 'reverse', animationDuration: '1.5s'}}></div>
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <span className="text-4xl">🔍</span>
+                </div>
+              </div>
+              <h3 className="text-white text-2xl font-bold mb-2">正在扫描</h3>
+              <p className="text-gray-300 text-sm mb-4">
+                {scanProgress.total > 0 
+                  ? `已扫描 ${scanProgress.current} / ${scanProgress.total} 项` 
+                  : '正在准备...'}
+              </p>
+              
+              {/* 进度条 */}
+              <div className="w-full bg-white/10 rounded-full h-3 mb-2 overflow-hidden">
+                <div 
+                  className="h-full bg-gradient-to-r from-purple-500 via-pink-500 to-orange-500 transition-all duration-300 ease-out"
+                  style={{ width: `${progressPercent}%` }}
+                ></div>
+              </div>
+              <p className="text-gray-400 text-xs mb-2">
+                {Math.round(progressPercent)}%
+              </p>
+              
+              {scanProgress.currentItem && (
+                <div className="bg-white/5 rounded-lg px-4 py-2 mt-3 max-w-md mx-auto">
+                  <p className="text-gray-400 text-xs mb-1">当前项目：</p>
+                  <p className="text-white text-sm font-mono truncate">
+                    {scanProgress.currentItem}
+                  </p>
+                </div>
+              )}
+            </div>
+          ) : items.length === 0 ? (
+            <div className="text-center">
+              <p className="text-gray-400 text-lg mb-4">选择目录并开始扫描</p>
+              <button
+                onClick={selectDirectory}
+                className="px-6 py-3 bg-gradient-to-r from-pink-500 to-orange-500 rounded-full text-white font-bold hover:opacity-90 transition-opacity"
+              >
+                📁 选择目录
+              </button>
+            </div>
+          ) : (
+            <div className="relative w-full h-full">
+              {/* 主要的大气泡（前3个） */}
+              {items.slice(0, 3).map((item, index) => {
+                const size = getBubbleSize(item.size, maxSize)
+                const positions = [
+                  { x: '30%', y: '50%' }, // 左中
+                  { x: '60%', y: '35%' }, // 右上
+                  { x: '55%', y: '65%' }, // 右下
+                ]
+                const pos = positions[index]
+                const isSelected = selectedItems.has(item.path)
+                
+                return (
+                  <div
+                    key={item.path}
+                    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all hover:scale-105"
+                    style={{
+                      left: pos.x,
+                      top: pos.y,
+                      width: `${size}px`,
+                      height: `${size}px`,
+                      zIndex: 10 - index,
+                    }}
+                    onClick={() => toggleSelection(item.path)}
+                    onDoubleClick={() => enterDirectory(item)}
+                  >
+                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center transition-all ${
+                      isSelected 
+                        ? 'bg-gradient-to-br from-pink-500/40 to-purple-600/40 ring-4 ring-pink-500/50' 
+                        : 'bg-gradient-to-br from-pink-500/30 to-purple-600/30'
+                    } backdrop-blur-md border border-white/10 shadow-2xl`}>
+                      <div className="text-4xl mb-2">
+                        {item.is_directory ? '📁' : '📄'}
+                      </div>
+                      <div className="text-white font-bold text-center px-4">
+                        {getDisplayName(item.name)}
+                      </div>
+                      <div className="text-white text-lg font-bold mt-1">
+                        {formatBytes(item.size)}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+
+              {/* 次要的小气泡（4-8个） */}
+              {items.slice(3, 8).map((item, index) => {
+                const size = getBubbleSize(item.size, maxSize) * 0.6
+                const positions = [
+                  { x: '15%', y: '20%' },
+                  { x: '80%', y: '20%' },
+                  { x: '85%', y: '50%' },
+                  { x: '75%', y: '80%' },
+                  { x: '20%', y: '75%' },
+                ]
+                const pos = positions[index] || { x: '50%', y: '50%' }
+                const isSelected = selectedItems.has(item.path)
+                
+                return (
+                  <div
+                    key={item.path}
+                    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all hover:scale-110"
+                    style={{
+                      left: pos.x,
+                      top: pos.y,
+                      width: `${size}px`,
+                      height: `${size}px`,
+                      zIndex: 5,
+                    }}
+                    onClick={() => toggleSelection(item.path)}
+                    onDoubleClick={() => enterDirectory(item)}
+                  >
+                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center ${
+                      isSelected
+                        ? 'bg-gradient-to-br from-purple-500/40 to-blue-500/40 ring-2 ring-purple-500/50'
+                        : 'bg-gradient-to-br from-purple-500/25 to-blue-500/25'
+                    } backdrop-blur-sm border border-white/10 shadow-xl`}>
+                      <div className="text-2xl mb-1">
+                        {item.is_directory ? '📁' : '📄'}
+                      </div>
+                      <div className="text-white text-xs font-bold text-center px-2">
+                        {getDisplayName(item.name)}
+                      </div>
+                      <div className="text-white text-sm font-bold mt-0.5">
+                        {formatBytes(item.size)}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+
+              {/* 更小的气泡（其余的） */}
+              {items.slice(8, 15).map((item, index) => {
+                const size = 60
+                const angle = (index / 7) * 2 * Math.PI
+                const radius = 200
+                const x = 50 + Math.cos(angle) * 35
+                const y = 50 + Math.sin(angle) * 35
+                const isSelected = selectedItems.has(item.path)
+                
+                return (
+                  <div
+                    key={item.path}
+                    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all hover:scale-125"
+                    style={{
+                      left: `${x}%`,
+                      top: `${y}%`,
+                      width: `${size}px`,
+                      height: `${size}px`,
+                      zIndex: 2,
+                    }}
+                    onClick={() => toggleSelection(item.path)}
+                    onDoubleClick={() => enterDirectory(item)}
+                  >
+                    <div className={`w-full h-full rounded-full flex items-center justify-center ${
+                      isSelected
+                        ? 'bg-purple-500/40 ring-1 ring-purple-500/50'
+                        : 'bg-purple-500/20'
+                    } backdrop-blur-sm border border-white/10 shadow-lg`}>
+                      <div className="text-lg">
+                        {item.is_directory ? '📁' : '📄'}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      {/* 顶部帮助按钮 */}
+      <button
+        onClick={() => setShowPermissionGuide(true)}
+        className="fixed top-5 right-5 w-10 h-10 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white text-xl transition-colors z-40"
+        title="权限设置帮助"
+      >
+        ?
+      </button>
+      </div>
+    </div>
+    </>
+  )
+}
+
+export default App
+

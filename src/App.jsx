@@ -12,9 +12,7 @@ function App() {
   const [selectedItems, setSelectedItems] = useState(new Set())
   const [pathHistory, setPathHistory] = useState([])
   const [stats, setStats] = useState({ count: 0, totalSize: 0 })
-  const [scanMode, setScanMode] = useState('fast') // 'fast' | 'large' | 'old' | 'duplicate'
   const [viewMode, setViewMode] = useState('bubble') // 'bubble' or 'list'
-  const [specialScanThreshold, setSpecialScanThreshold] = useState(100) // 大文件阈值 (MB) 或 旧文件天数
   const [showDeleteHistory, setShowDeleteHistory] = useState(false) // 显示删除历史面板
   const [showPermissionGuide, setShowPermissionGuide] = useState(false)
   const [hasFullDiskAccess, setHasFullDiskAccess] = useState(true) // 权限状态
@@ -90,7 +88,7 @@ function App() {
     }
   }
 
-  const startScan = async (mode = scanMode, forceRefresh = false) => {
+  const startScan = async (forceRefresh = false) => {
     if (!currentPath) return
     
     // 检查缓存（除非强制刷新）
@@ -123,8 +121,7 @@ function App() {
     })
     
     try {
-      const command = mode === 'fast' ? 'scan_directory_fast' : 'scan_directory'
-      const result = await invoke(command, { path: currentPath })
+      const result = await invoke('scan_directory_fast', { path: currentPath })
       
       // 确保显示 100%
       setProgressPercent(100)
@@ -141,16 +138,15 @@ function App() {
       }))
       
       // ⚡️ 关键优化：后台预缓存前5个最大的子目录
-      // 这样点击进入时就能立即显示！
       setTimeout(async () => {
         const topDirs = result.items
           .filter(item => item.is_directory)
-          .slice(0, 5) // 只缓存前5个
+          .slice(0, 5)
         
         for (const item of topDirs) {
           if (!scanCache[item.path]) {
             try {
-              const subResult = await invoke(command, { path: item.path })
+              const subResult = await invoke('scan_directory_fast', { path: item.path })
               const subStats = {
                 count: subResult.items.length,
                 totalSize: subResult.items.reduce((sum, i) => sum + i.size, 0)
@@ -216,8 +212,7 @@ function App() {
     })
     
     try {
-      const command = scanMode === 'fast' ? 'scan_directory_fast' : 'scan_directory'
-      const result = await invoke(command, { path: item.path })
+      const result = await invoke('scan_directory_fast', { path: item.path })
       
       setProgressPercent(100)
       
@@ -326,9 +321,20 @@ function App() {
       
       localStorage.setItem('delete-history', JSON.stringify(deleteHistory))
       
-      alert('✅ 已移到废纸篓！\n可以在废纸篓中恢复这些文件。\n\n删除历史已保存，可在"删除历史"中查看。')
+      // 清空选中项
       setSelectedItems(new Set())
-      startScan()
+      
+      // 清除当前目录缓存并立即刷新
+      setScanCache(prev => {
+        const newCache = { ...prev }
+        delete newCache[currentPath]
+        return newCache
+      })
+      
+      // 立即重新扫描
+      await startScan('fast', true)
+      
+      alert('✅ 已移到废纸篓！\n可以在废纸篓中恢复这些文件。\n\n删除历史已保存，可在"删除历史"中查看。')
     } catch (error) {
       alert('❌ 移到废纸篓失败:\n' + error)
     }
@@ -539,80 +545,6 @@ function App() {
             <span className="text-white font-mono text-xs">{currentPath}</span>
           </div>
 
-          {/* 扫描模式选择 */}
-          <div className="mb-3">
-            <label className="text-gray-400 text-xs mb-2 block">
-              扫描模式 
-              {scanMode !== 'fast' && (
-                <span className="ml-2 text-purple-400">
-                  (当前: {
-                    scanMode === 'large' ? '大文件' : 
-                    scanMode === 'old' ? '旧文件' : 
-                    '重复文件'
-                  })
-                </span>
-              )}
-            </label>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={() => setScanMode('fast')}
-                className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                  scanMode === 'fast' 
-                    ? 'bg-purple-600 text-white' 
-                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
-                }`}
-              >
-                ⚡ 快速扫描
-              </button>
-              <button
-                onClick={() => setScanMode('large')}
-                className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                  scanMode === 'large' 
-                    ? 'bg-purple-600 text-white' 
-                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
-                }`}
-              >
-                📦 大文件
-              </button>
-              <button
-                onClick={() => setScanMode('old')}
-                className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                  scanMode === 'old' 
-                    ? 'bg-purple-600 text-white' 
-                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
-                }`}
-              >
-                📅 旧文件
-              </button>
-              <button
-                onClick={() => setScanMode('duplicate')}
-                className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                  scanMode === 'duplicate' 
-                    ? 'bg-purple-600 text-white' 
-                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
-                }`}
-              >
-                🔄 重复文件
-              </button>
-            </div>
-            
-            {/* 阈值设置 */}
-            {(scanMode === 'large' || scanMode === 'old') && (
-              <div className="mt-2">
-                <label className="text-gray-400 text-xs block mb-1">
-                  {scanMode === 'large' ? '最小文件大小 (MB)' : '未修改天数'}
-                </label>
-                <input
-                  type="number"
-                  value={specialScanThreshold}
-                  onChange={(e) => setSpecialScanThreshold(Number(e.target.value))}
-                  className="w-full px-3 py-1.5 bg-white/5 border border-white/10 rounded-lg text-white text-sm"
-                  min={scanMode === 'large' ? 1 : 1}
-                  max={scanMode === 'large' ? 10000 : 365}
-                />
-              </div>
-            )}
-          </div>
 
           {/* 目录信息卡片 */}
           <div className="bg-gradient-to-br from-purple-900/30 to-purple-800/20 rounded-2xl p-5 backdrop-blur-sm border border-purple-500/20">
@@ -718,17 +650,12 @@ function App() {
                   delete newCache[currentPath]
                   return newCache
                 })
-                startScan(scanMode, true)
+                startScan(true)
               }}
               disabled={isScanning || !currentPath}
               className="flex-1 px-3 py-2 bg-purple-600/80 hover:bg-purple-600 rounded-lg text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
-              {isScanning ? '扫描中...' : (
-                scanMode === 'fast' ? '🔄 扫描' :
-                scanMode === 'large' ? '📦 扫大文件' :
-                scanMode === 'old' ? '📅 扫旧文件' :
-                '🔄 扫重复'
-              )}
+              {isScanning ? '扫描中...' : '🔄 扫描'}
             </button>
             <button
               onClick={deleteSelected}
@@ -880,23 +807,24 @@ function App() {
                     onClick={() => toggleSelection(item.path)}
                     onDoubleClick={() => enterDirectory(item)}
                   >
-                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center gap-0.5 ${
+                    <div className={`w-full h-full rounded-full flex flex-col items-center justify-center gap-1 ${
                       isSelected
                         ? 'bg-gradient-to-br from-purple-500/40 to-blue-500/40 ring-2 ring-purple-500/50'
                         : 'bg-gradient-to-br from-purple-500/25 to-blue-500/25'
-                    } backdrop-blur-sm border border-white/10 shadow-xl overflow-hidden`} style={{padding: '10%'}}>
-                      <div className="text-2xl flex-shrink-0">
+                    } backdrop-blur-sm border border-white/10 shadow-xl p-4`}>
+                      <div className="text-3xl flex-shrink-0 mb-1">
                         {item.is_directory ? '📁' : '📄'}
                       </div>
-                      <div className="text-white text-xs font-bold text-center leading-tight w-full overflow-hidden" style={{
+                      <div className="text-white text-sm font-bold text-center leading-tight w-full" style={{
                         display: '-webkit-box',
                         WebkitLineClamp: 2,
                         WebkitBoxOrient: 'vertical',
-                        wordBreak: 'break-word'
+                        wordBreak: 'break-word',
+                        overflow: 'hidden'
                       }}>
-                        {getDisplayName(item.name, 12)}
+                        {getDisplayName(item.name, 15)}
                       </div>
-                      <div className="text-white/90 text-xs font-bold flex-shrink-0">
+                      <div className="text-white/90 text-sm font-bold flex-shrink-0 mt-1">
                         {formatBytes(item.size)}
                       </div>
                     </div>
@@ -928,15 +856,24 @@ function App() {
                     onDoubleClick={() => enterDirectory(item)}
                   >
                     <div 
-                      className={`w-full h-full rounded-full flex items-center justify-center ${
+                      className={`w-full h-full rounded-full flex flex-col items-center justify-center gap-0.5 p-2 ${
                         isSelected
                           ? 'bg-purple-500/40 ring-1 ring-purple-500/50'
                           : 'bg-purple-500/20'
                       } backdrop-blur-sm border border-white/10 shadow-lg`}
                       title={`${item.name}\n${formatBytes(item.size)}`}
                     >
-                      <div className="text-2xl">
+                      <div className="text-xl flex-shrink-0">
                         {item.is_directory ? '📁' : '📄'}
+                      </div>
+                      <div className="text-white text-[10px] font-bold text-center leading-tight" style={{
+                        display: '-webkit-box',
+                        WebkitLineClamp: 1,
+                        WebkitBoxOrient: 'vertical',
+                        wordBreak: 'break-word',
+                        overflow: 'hidden'
+                      }}>
+                        {getDisplayName(item.name, 8)}
                       </div>
                     </div>
                   </div>

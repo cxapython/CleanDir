@@ -10,11 +10,11 @@
 
 ### Apple Silicon (M1/M2/M3)
 - **文件**: `CleanDir-v1.4.0-macOS-aarch64.dmg` (2.6 MB)
-- **SHA256**: `a3c493bafdd077b64708539ca7d78cafd9b2d7c1da268ff1fd05badf92be592c`
+- **SHA256**: `b45b64651be0e082bbe6b360293725659734e3b1e5011b3eea185faa8208d9f0`
 
 ### Intel 芯片
 - **文件**: `CleanDir-v1.4.0-macOS-x86_64.dmg` (2.7 MB)
-- **SHA256**: `3e6013a4c259c568d97fd5477790fa417915124898549075ab078854d5855b8a`
+- **SHA256**: `3b4c3c231d393a1e0ba30cc49b3ec28aca6dc42fb8c27337f587272c9e53b68b`
 
 ---
 

@@ -19,13 +19,10 @@ struct ScanResult {
     items: Vec<DiskItem>,
 }
 
-// 使用 Rust 原生 API + rayon 并行处理 + 真实进度推送
+// 使用 Rust 原生 API + rayon 并行处理（快速且无权限弹窗）
 #[tauri::command]
-fn scan_directory_fast(path: String, window: tauri::Window) -> Result<ScanResult, String> {
+fn scan_directory_fast(path: String) -> Result<ScanResult, String> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::Instant;
     
     let path_obj = Path::new(&path);
     
@@ -34,18 +31,6 @@ fn scan_directory_fast(path: String, window: tauri::Window) -> Result<ScanResult
         Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
         Err(e) => return Err(format!("读取目录失败: {}", e)),
     };
-    
-    let total = entries.len();
-    let completed = Arc::new(AtomicUsize::new(0));
-    let last_emit = Arc::new(std::sync::Mutex::new(Instant::now()));
-    
-    // 🔥 关键：先发送初始进度（显示总数）
-    window.emit("scan-progress", serde_json::json!({
-        "percent": 0.0,
-        "current": 0,
-        "total": total,
-        "phase": "scanning"
-    })).ok();
     
     // 使用 rayon 并行处理所有条目
     let items: Vec<DiskItem> = entries
@@ -67,37 +52,13 @@ fn scan_directory_fast(path: String, window: tauri::Window) -> Result<ScanResult
             
             let is_directory = metadata.is_dir();
             
-            // 计算大小（耗时操作）
+            // 计算大小
             let size = if is_directory {
-                calculate_dir_size_walkdir(&entry_path)
+                // 使用并行递归计算目录大小
+                calculate_dir_size_parallel(&entry_path)
             } else {
                 metadata.len()
             };
-            
-            // 🔥 关键改进：计算完成后才更新进度（基于完成数量）
-            let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            // 智能控制发送频率
-            let should_emit = {
-                let mut last = last_emit.lock().unwrap();
-                let elapsed = last.elapsed().as_millis();
-                if count % 3 == 0 || count == total || elapsed > 200 {
-                    *last = Instant::now();
-                    true
-                } else {
-                    false
-                }
-            };
-            
-            if should_emit {
-                let percent = ((count as f64 / total as f64) * 95.0).min(95.0);
-                window.emit("scan-progress", serde_json::json!({
-                    "percent": percent,
-                    "current": count,
-                    "total": total,
-                    "current_item": name.clone()
-                })).ok();
-            }
             
             Some(DiskItem {
                 name,
@@ -109,13 +70,6 @@ fn scan_directory_fast(path: String, window: tauri::Window) -> Result<ScanResult
         })
         .collect();
     
-    // 发送完成进度
-    window.emit("scan-progress", serde_json::json!({
-        "percent": 100.0,
-        "current": total,
-        "total": total
-    })).ok();
-    
     // 按大小降序排序
     let mut items = items;
     items.sort_by(|a, b| b.size.cmp(&a.size));
@@ -125,11 +79,39 @@ fn scan_directory_fast(path: String, window: tauri::Window) -> Result<ScanResult
 
 // 完整扫描目录（和快速扫描相同）
 #[tauri::command]
-fn scan_directory(path: String, window: tauri::Window) -> Result<ScanResult, String> {
-    scan_directory_fast(path, window)
+fn scan_directory(path: String) -> Result<ScanResult, String> {
+    scan_directory_fast(path)
 }
 
-// 使用 walkdir 库计算目录大小（可靠且准确）
+// 使用 rayon 并行计算目录大小（快速且准确）
+fn calculate_dir_size_parallel(path: &Path) -> u64 {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    
+    let total_size = Arc::new(AtomicU64::new(0));
+    
+    // 递归遍历目录
+    if let Ok(entries) = fs::read_dir(path) {
+        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        
+        entries.par_iter().for_each(|entry| {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    total_size.fetch_add(metadata.len(), Ordering::Relaxed);
+                } else if metadata.is_dir() {
+                    // 递归计算子目录
+                    let sub_size = calculate_dir_size_parallel(&entry.path());
+                    total_size.fetch_add(sub_size, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    
+    total_size.load(Ordering::Relaxed)
+}
+
+// 使用 walkdir 库计算目录大小（更可靠的回退方案）
 fn calculate_dir_size_walkdir(path: &Path) -> u64 {
     use walkdir::WalkDir;
     

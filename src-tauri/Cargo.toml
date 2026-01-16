@@ -1,6 +1,6 @@
 [package]
 name = "space-visualizer"
-version = "1.4.0"
+version = "1.5.0"
 description = "空间透视 - 磁盘空间分析工具"
 authors = ["CleanDir"]
 edition = "2021"

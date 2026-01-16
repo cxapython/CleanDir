@@ -149,6 +149,7 @@ fn is_duplicate_inode(inode: u64, seen_inodes: &InodeSet) -> bool {
 // ==================== 扫描核心逻辑 ====================
 
 // 使用 walkdir 计算目录大小 (支持智能过滤、硬链接去重)
+// 增加进度回调支持
 fn calculate_dir_size_walkdir(
     path: &Path,
     enable_smart_filter: bool,
@@ -158,6 +159,7 @@ fn calculate_dir_size_walkdir(
 
     WalkDir::new(path)
         .follow_links(false)
+        .max_depth(10) // 限制递归深度，避免无限深入
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -178,7 +180,7 @@ fn calculate_dir_size_walkdir(
         .sum()
 }
 
-// ==================== 快速扫描 (支持进度推送) ====================
+// ==================== 快速扫描 (两阶段优化版) ====================
 
 #[tauri::command]
 async fn scan_directory_fast(
@@ -200,14 +202,25 @@ async fn scan_directory_fast(
         Err(e) => return Err(format!("读取目录失败: {}", e)),
     };
 
-    // 进度追踪
     let total = entries.len();
-    let current = Arc::new(AtomicUsize::new(0));
     let start_time = SystemTime::now();
 
-    // 使用 rayon 并行处理所有条目
-    let items: Vec<DiskItem> = entries
-        .par_iter()
+    // 发送初始进度
+    let _ = window.emit(
+        "scan-progress",
+        ScanProgress {
+            percent: 5,
+            current: 0,
+            total,
+            current_item: "正在读取目录列表...".to_string(),
+            elapsed_seconds: 0,
+            estimated_remaining_seconds: 0,
+        },
+    );
+
+    // 第一阶段: 快速收集基本信息
+    let mut items: Vec<DiskItem> = entries
+        .iter()
         .filter_map(|entry| {
             let entry_path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -222,18 +235,16 @@ async fn scan_directory_fast(
                 return None;
             }
 
-            // 获取元数据 (记录错误类型)
+            // 获取元数据
             let metadata = match entry_path.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    // 记录错误但继续扫描
                     let error_type = ErrorType::from(&e);
                     let error_msg = match error_type {
                         ErrorType::PermissionDenied => "无权限访问",
                         ErrorType::NotFound => "文件不存在",
                         ErrorType::IOError => "磁盘 I/O 错误",
                     };
-                    
                     return Some(DiskItem {
                         name,
                         path: entry_path.to_string_lossy().to_string(),
@@ -247,58 +258,18 @@ async fn scan_directory_fast(
             };
 
             let is_directory = metadata.is_dir();
-
-            // 创建 inode 集合 (用于硬链接去重)
-            let seen_inodes: InodeSet = Arc::new(Mutex::new(HashSet::new()));
-
-            // 计算大小
-            let size = if is_directory {
-                calculate_dir_size_walkdir(&entry_path, enable_filter, &seen_inodes)
-            } else {
-                // 文件也需要检查 inode
-                let inode = metadata.ino();
-                if is_duplicate_inode(inode, &seen_inodes) {
-                    0 // 硬链接,跳过
-                } else {
-                    metadata.blocks() * 512
-                }
-            };
-
-            // 文件类型识别
             let file_type = if is_directory {
                 Some("directory".to_string())
             } else {
                 get_file_type(&name)
             };
 
-            // 更新进度
-            let curr = current.fetch_add(1, Ordering::Relaxed) + 1;
-            if curr % 5 == 0 || curr == total {
-                // 每 5 项推送一次进度
-                let elapsed = start_time.elapsed().unwrap_or_default().as_secs();
-                let percent = ((curr as f64 / total as f64) * 100.0) as u8;
-                let speed = if elapsed > 0 {
-                    curr as f64 / elapsed as f64
-                } else {
-                    0.0
-                };
-                let remaining = if speed > 0.0 {
-                    ((total - curr) as f64 / speed) as u64
-                } else {
-                    0
-                };
-
-                let progress = ScanProgress {
-                    percent,
-                    current: curr,
-                    total,
-                    current_item: name.clone(),
-                    elapsed_seconds: elapsed,
-                    estimated_remaining_seconds: remaining,
-                };
-
-                let _ = window.emit("scan-progress", progress);
-            }
+            // 文件直接获取大小，目录先设为 0
+            let size = if is_directory {
+                0
+            } else {
+                metadata.blocks() * 512
+            };
 
             Some(DiskItem {
                 name,
@@ -312,15 +283,79 @@ async fn scan_directory_fast(
         })
         .collect();
 
+    // 发送 20% 进度
+    let _ = window.emit(
+        "scan-progress",
+        ScanProgress {
+            percent: 20,
+            current: items.len(),
+            total: items.len(),
+            current_item: "正在计算目录大小...".to_string(),
+            elapsed_seconds: start_time.elapsed().unwrap_or_default().as_secs(),
+            estimated_remaining_seconds: 0,
+        },
+    );
+
+    // 第二阶段: 并行计算目录大小
+    let dirs_count = items.iter().filter(|i| i.is_directory).count();
+    let processed_dirs = Arc::new(AtomicUsize::new(0));
+    let seen_inodes: InodeSet = Arc::new(Mutex::new(HashSet::new()));
+
+    // 并行计算每个目录的大小
+    let dir_sizes: Vec<(String, u64)> = items
+        .par_iter()
+        .filter(|item| item.is_directory)
+        .map(|item| {
+            let path = Path::new(&item.path);
+            let size = calculate_dir_size_walkdir(path, enable_filter, &seen_inodes);
+            
+            // 更新进度
+            let curr = processed_dirs.fetch_add(1, Ordering::Relaxed) + 1;
+            let base_percent = 20;
+            let progress_percent = base_percent + ((curr as f64 / dirs_count.max(1) as f64) * 75.0) as u8;
+            
+            let elapsed = start_time.elapsed().unwrap_or_default().as_secs();
+            let speed = if elapsed > 0 { curr as f64 / elapsed as f64 } else { 0.0 };
+            let remaining = if speed > 0.0 && dirs_count > curr {
+                ((dirs_count - curr) as f64 / speed) as u64
+            } else {
+                0
+            };
+
+            let _ = window.emit(
+                "scan-progress",
+                ScanProgress {
+                    percent: progress_percent.min(95),
+                    current: curr,
+                    total: dirs_count,
+                    current_item: item.name.clone(),
+                    elapsed_seconds: elapsed,
+                    estimated_remaining_seconds: remaining,
+                },
+            );
+
+            (item.path.clone(), size)
+        })
+        .collect();
+
+    // 更新目录大小
+    let size_map: HashMap<String, u64> = dir_sizes.into_iter().collect();
+    for item in &mut items {
+        if item.is_directory {
+            if let Some(&size) = size_map.get(&item.path) {
+                item.size = size;
+            }
+        }
+    }
+
     // 按优先级和大小排序
-    let mut items = items;
     items.sort_by(|a, b| {
         let a_priority = get_dir_priority(Path::new(&a.path));
         let b_priority = get_dir_priority(Path::new(&b.path));
         if a_priority != b_priority {
-            b_priority.cmp(&a_priority) // 优先级高的在前
+            b_priority.cmp(&a_priority)
         } else {
-            b.size.cmp(&a.size) // 相同优先级,大小降序
+            b.size.cmp(&a.size)
         }
     });
 
@@ -329,8 +364,8 @@ async fn scan_directory_fast(
         "scan-progress",
         ScanProgress {
             percent: 100,
-            current: total,
-            total,
+            current: dirs_count,
+            total: dirs_count,
             current_item: "完成".to_string(),
             elapsed_seconds: start_time.elapsed().unwrap_or_default().as_secs(),
             estimated_remaining_seconds: 0,

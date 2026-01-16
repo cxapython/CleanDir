@@ -4,6 +4,7 @@ import { open } from '@tauri-apps/api/dialog'
 import { homeDir } from '@tauri-apps/api/path'
 import { listen } from '@tauri-apps/api/event'
 import PermissionGuide from './PermissionGuide'
+import DeleteConfirmModal from './DeleteConfirmModal'
 
 function App() {
   const [currentPath, setCurrentPath] = useState('')
@@ -26,6 +27,8 @@ function App() {
     elapsed_seconds: 0,
     estimated_remaining_seconds: 0 
   }) // 扫描进度详情
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false) // 删除确认弹窗
+  const [toast, setToast] = useState({ show: false, message: '', type: 'success' }) // Toast 提示
 
   useEffect(() => {
     // 初始化：设置默认路径并检测权限
@@ -265,35 +268,31 @@ function App() {
     setSelectedItems(newSelected)
   }
 
-  const deleteSelected = async () => {
-    if (selectedItems.size === 0) return
-    
-    const itemsToDelete = Array.from(selectedItems).map(path => {
+  // 获取待删除的项目列表
+  const getItemsToDelete = () => {
+    return Array.from(selectedItems).map(path => {
       const item = items.find(i => i.path === path)
       return item
     }).filter(Boolean)
-    
-    const totalSize = itemsToDelete.reduce((sum, item) => sum + item.size, 0)
-    const totalCount = itemsToDelete.reduce((sum, item) => {
-      return sum + (item.is_directory ? (item.item_count || 1) : 1)
-    }, 0)
-    
-    // 检查是否有目录
-    const hasDirectory = itemsToDelete.some(item => item.is_directory)
-    
-    let confirmMessage = `确定要移到废纸篓吗？\n\n` +
-      `选中项: ${selectedItems.size} 个\n` +
-      `总大小: ${formatBytes(totalSize)}\n`
-    
-    if (hasDirectory) {
-      confirmMessage += `包含文件/目录: ${totalCount} 项\n`
-    }
-    
-    confirmMessage += `\n💡 提示: 文件会移到废纸篓，可以恢复`
-    
-    const confirmed = window.confirm(confirmMessage)
-    
-    if (!confirmed) return
+  }
+
+  // 显示 Toast 提示
+  const showToast = (message, type = 'success') => {
+    setToast({ show: true, message, type })
+    setTimeout(() => {
+      setToast({ show: false, message: '', type: 'success' })
+    }, 4000)
+  }
+
+  // 打开删除确认对话框
+  const handleDeleteClick = () => {
+    if (selectedItems.size === 0) return
+    setShowDeleteConfirm(true)
+  }
+
+  // 确认删除
+  const confirmDelete = async () => {
+    const itemsToDelete = getItemsToDelete()
     
     try {
       const pathsToDelete = Array.from(selectedItems)
@@ -324,6 +323,9 @@ function App() {
       // 清空选中项
       setSelectedItems(new Set())
       
+      // 关闭确认对话框
+      setShowDeleteConfirm(false)
+      
       // 清除当前目录缓存并立即刷新
       setScanCache(prev => {
         const newCache = { ...prev }
@@ -334,9 +336,11 @@ function App() {
       // 立即重新扫描
       await startScan('fast', true)
       
-      alert('✅ 已移到废纸篓！\n可以在废纸篓中恢复这些文件。\n\n删除历史已保存，可在"删除历史"中查看。')
+      // 显示成功提示
+      showToast(`✅ 已移到废纸篓！共 ${itemsToDelete.length} 项，可随时恢复`, 'success')
     } catch (error) {
-      alert('❌ 移到废纸篓失败:\n' + error)
+      setShowDeleteConfirm(false)
+      showToast(`❌ 移到废纸篓失败: ${error}`, 'error')
     }
   }
 
@@ -390,6 +394,43 @@ function App() {
 
   return (
     <>
+      {/* Toast 提示 */}
+      {toast.show && (
+        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[60] px-6 py-3 rounded-xl shadow-2xl flex items-center gap-3 animate-slide-down ${
+          toast.type === 'success' 
+            ? 'bg-gradient-to-r from-green-500 to-emerald-600' 
+            : 'bg-gradient-to-r from-red-500 to-orange-600'
+        }`}
+        style={{
+          animation: 'slideDown 0.3s ease-out'
+        }}>
+          <span className="text-xl">{toast.type === 'success' ? '✅' : '❌'}</span>
+          <span className="text-white font-semibold">{toast.message}</span>
+        </div>
+      )}
+      
+      <style>{`
+        @keyframes slideDown {
+          from {
+            opacity: 0;
+            transform: translate(-50%, -20px);
+          }
+          to {
+            opacity: 1;
+            transform: translate(-50%, 0);
+          }
+        }
+      `}</style>
+
+      {/* 删除确认对话框 */}
+      <DeleteConfirmModal
+        isOpen={showDeleteConfirm}
+        onClose={() => setShowDeleteConfirm(false)}
+        onConfirm={confirmDelete}
+        items={getItemsToDelete()}
+        formatBytes={formatBytes}
+      />
+
       {/* 删除历史面板 */}
       {showDeleteHistory && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
@@ -658,7 +699,7 @@ function App() {
               {isScanning ? '扫描中...' : '🔄 扫描'}
             </button>
             <button
-              onClick={deleteSelected}
+              onClick={handleDeleteClick}
               disabled={selectedItems.size === 0}
               className="flex-1 px-3 py-2 bg-gradient-to-r from-pink-500 to-orange-500 hover:opacity-90 rounded-lg text-white text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed transition-opacity"
             >
@@ -687,22 +728,28 @@ function App() {
                   <span className="text-4xl">🔍</span>
                 </div>
               </div>
-              <h3 className="text-white text-2xl font-bold mb-2">正在扫描</h3>
+              <h3 className="text-white text-2xl font-bold mb-2">
+                {progressPercent < 20 ? '正在读取目录' : progressPercent < 95 ? '正在计算大小' : '即将完成'}
+              </h3>
               <p className="text-gray-300 text-sm mb-4">
-                {scanProgress.total > 0 
-                  ? `已扫描 ${scanProgress.current} / ${scanProgress.total} 项` 
-                  : '正在准备...'}
+                {progressPercent < 20 
+                  ? '快速扫描目录结构...'
+                  : scanProgress.total > 0 
+                    ? `已处理 ${scanProgress.current} / ${scanProgress.total} 个目录` 
+                    : '正在计算目录大小...'}
               </p>
-              {scanProgress.estimated_remaining_seconds > 0 && (
+              {scanProgress.estimated_remaining_seconds > 0 && progressPercent >= 20 && (
                 <p className="text-purple-300 text-sm mb-2">
-                  ⏱️ 预计剩余: {Math.floor(scanProgress.estimated_remaining_seconds / 60)}分{scanProgress.estimated_remaining_seconds % 60}秒
+                  ⏱️ 预计剩余: {scanProgress.estimated_remaining_seconds > 60 
+                    ? `${Math.floor(scanProgress.estimated_remaining_seconds / 60)}分${scanProgress.estimated_remaining_seconds % 60}秒`
+                    : `${scanProgress.estimated_remaining_seconds}秒`}
                 </p>
               )}
               
               {/* 进度条 */}
               <div className="w-full bg-white/10 rounded-full h-3 mb-2 overflow-hidden">
                 <div 
-                  className="h-full bg-gradient-to-r from-purple-500 via-pink-500 to-orange-500 transition-all duration-300 ease-out"
+                  className="h-full bg-gradient-to-r from-purple-500 via-pink-500 to-orange-500 transition-all duration-500 ease-out"
                   style={{ width: `${progressPercent}%` }}
                 ></div>
               </div>
@@ -710,9 +757,9 @@ function App() {
                 {Math.round(progressPercent)}%
               </p>
               
-              {scanProgress.currentItem && (
+              {scanProgress.currentItem && progressPercent >= 20 && (
                 <div className="bg-white/5 rounded-lg px-4 py-2 mt-3 max-w-md mx-auto">
-                  <p className="text-gray-400 text-xs mb-1">当前项目：</p>
+                  <p className="text-gray-400 text-xs mb-1">正在处理：</p>
                   <p className="text-white text-sm font-mono truncate">
                     {scanProgress.currentItem}
                   </p>

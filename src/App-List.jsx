@@ -112,7 +112,7 @@ function App() {
     if (selectedItems.size === 0) return
     
     const confirmed = window.confirm(
-      `确定要删除选中的 ${selectedItems.size} 项吗？\n此操作不可恢复！`
+      `确定要移到废纸篓吗？\n\n选中: ${selectedItems.size} 项\n\n💡 提示: 文件会移到废纸篓，可以恢复`
     )
     
     if (!confirmed) return
@@ -120,7 +120,7 @@ function App() {
     try {
       const pathsToDelete = Array.from(selectedItems)
       await invoke('delete_items', { paths: pathsToDelete })
-      alert('删除成功！')
+      alert('✅ 已移到废纸篓！可在废纸篓中恢复')
       setSelectedItems(new Set())
       startScan() // 重新扫描
     } catch (error) {

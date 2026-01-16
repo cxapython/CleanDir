@@ -34,6 +34,14 @@ struct ScanResult {
 }
 
 #[derive(Debug, Serialize, Clone)]
+struct DeleteProgress {
+    percent: u8,
+    current: usize,
+    total: usize,
+    current_item: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct ScanProgress {
     percent: u8,
     current: usize,
@@ -410,42 +418,43 @@ async fn scan_directory(
     scan_directory_fast(path, window, enable_smart_filter).await
 }
 
-// ==================== 安全删除 (增强版) ====================
+// ==================== 安全删除 (优化版：移除预处理，直接删除) ====================
 
 #[tauri::command]
-fn delete_items(paths: Vec<String>) -> Result<String, String> {
+async fn delete_items(window: Window, paths: Vec<String>) -> Result<String, String> {
     use std::process::Command;
+    use std::time::{Duration, Instant};
 
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
+    let total = paths.len();
 
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
         let path_obj = Path::new(&path);
+
+        // 发送进度更新
+        let percent = ((index as f64 / total as f64) * 100.0) as u8;
+        let _ = window.emit("delete-progress", serde_json::json!({
+            "percent": percent,
+            "current": index + 1,
+            "total": total,
+            "current_item": Path::new(&path).file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("未知文件")
+                .to_string()
+        }));
 
         if !path_obj.exists() {
             errors.push(format!("{}: 文件不存在", path));
             continue;
         }
 
-        // 检查是否是目录以及文件数量
-        let (_is_dir, _item_count, _total_size) = if path_obj.is_dir() {
-            let seen_inodes: InodeSet = Arc::new(Mutex::new(HashSet::new()));
-            let size = calculate_dir_size_walkdir(path_obj, false, &seen_inodes);
-            let count = walkdir::WalkDir::new(path_obj)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .count();
-            (true, count, size)
-        } else {
-            (
-                false,
-                1,
-                path_obj.metadata().map(|m| m.len()).unwrap_or(0),
-            )
-        };
+        // 🚀 关键优化：直接删除，不要预先统计！
+        // 移除耗时的 calculate_dir_size_walkdir 和 walkdir count 操作
 
-        // 使用 macOS 的 osascript 移到废纸篓
+        let start_time = Instant::now();
+
+        // 执行删除命令
         let result = Command::new("osascript")
             .arg("-e")
             .arg(format!(
@@ -456,18 +465,32 @@ fn delete_items(paths: Vec<String>) -> Result<String, String> {
 
         match result {
             Ok(output) => {
-                if !output.status.success() {
+                if output.status.success() {
+                    deleted.push(path.clone());
+                } else {
                     let error_msg = String::from_utf8_lossy(&output.stderr);
                     errors.push(format!("{}: {}", path, error_msg));
-                } else {
-                    deleted.push(path.clone());
                 }
             }
             Err(e) => {
-                errors.push(format!("{}: {}", path, e));
+                // 如果命令执行失败，可能是权限问题或其他系统错误
+                errors.push(format!("{}: 删除失败 - {}", path, e));
             }
         }
+
+        // 检查是否超时（虽然不太可能，但作为安全措施）
+        if start_time.elapsed() > Duration::from_secs(60) {
+            println!("警告：删除 {} 耗时过长 ({}s)", path, start_time.elapsed().as_secs());
+        }
     }
+
+    // 发送完成信号
+    let _ = window.emit("delete-progress", serde_json::json!({
+        "percent": 100,
+        "current": total,
+        "total": total,
+        "current_item": "完成"
+    }));
 
     // 返回删除结果摘要
     if errors.is_empty() {

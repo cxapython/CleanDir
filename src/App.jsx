@@ -29,27 +29,57 @@ function App() {
   }) // 扫描进度详情
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false) // 删除确认弹窗
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' }) // Toast 提示
+  const [deleteProgress, setDeleteProgress] = useState({ show: false, percent: 0, current: 0, total: 0, currentItem: '' }) // 删除进度
 
   useEffect(() => {
     // 初始化：设置默认路径并检测权限
     const initialize = async () => {
       // 默认扫描 /Users 目录
       setCurrentPath('/Users')
-      
+
+      // 设置事件监听器
+      const unlistenScan = await listen('scan-progress', (event) => {
+        const { percent, current, total, current_item } = event.payload
+        setProgressPercent(percent || 0)
+        setScanProgress({
+          current: current || 0,
+          total: total || 0,
+          currentItem: current_item || ''
+        })
+      })
+
+      const unlistenDelete = await listen('delete-progress', (event) => {
+        const { percent, current, total, current_item } = event.payload
+        setDeleteProgress({
+          show: true,
+          percent: percent || 0,
+          current: current || 0,
+          total: total || 0,
+          currentItem: current_item || ''
+        })
+
+        // 删除完成时隐藏进度条
+        if (percent >= 100) {
+          setTimeout(() => {
+            setDeleteProgress(prev => ({ ...prev, show: false }))
+          }, 1000)
+        }
+      })
+
       // 检测磁盘访问权限（添加超时保护）
       try {
         // 使用 Promise.race 添加超时机制
         const checkPermission = invoke('check_disk_access_permission')
-        const timeout = new Promise((_, reject) => 
+        const timeout = new Promise((_, reject) =>
           setTimeout(() => reject(new Error('超时')), 3000)
         )
-        
+
         const hasPermission = await Promise.race([checkPermission, timeout])
           .catch(() => false)  // 超时或错误，假设没有权限
-        
+
         setHasFullDiskAccess(hasPermission)
         setIsLoading(false) // 加载完成
-        
+
         if (!hasPermission) {
           // 没有权限，延迟显示引导
           setTimeout(() => {
@@ -73,9 +103,20 @@ function App() {
           setShowPermissionGuide(true)
         }, 1500)
       }
+
+      // 返回清理函数
+      return () => {
+        unlistenScan()
+        unlistenDelete()
+      }
     }
-    
-    initialize()
+
+    const cleanup = initialize()
+
+    // 清理监听器
+    return () => {
+      cleanup.then(cleanupFn => cleanupFn && cleanupFn())
+    }
   }, [])
 
   const selectDirectory = async () => {
@@ -111,17 +152,6 @@ function App() {
     
     // 使用 setTimeout 确保状态更新完成并渲染后再执行扫描
     await new Promise(resolve => setTimeout(resolve, 50))
-    
-    // 🔥 监听后端真实进度（详细信息）
-    const unlisten = await listen('scan-progress', (event) => {
-      const { percent, current, total, current_item } = event.payload
-      setProgressPercent(percent || 0)
-      setScanProgress({
-        current: current || 0,
-        total: total || 0,
-        currentItem: current_item || ''
-      })
-    })
     
     try {
       const result = await invoke('scan_directory_fast', { path: currentPath })
@@ -293,15 +323,20 @@ function App() {
   // 确认删除
   const confirmDelete = async () => {
     const itemsToDelete = getItemsToDelete()
-    
+
     try {
       const pathsToDelete = Array.from(selectedItems)
-      await invoke('delete_items', { paths: pathsToDelete })
-      
+
+      // 显示开始删除的提示
+      showToast(`🗑️ 正在删除 ${itemsToDelete.length} 项...`, 'info')
+
+      // 调用删除API，设置更长的超时时间 (5分钟)
+      await invoke('delete_items', { paths: pathsToDelete }, { timeout: 300000 })
+
       // 保存删除历史到 localStorage
       const deleteHistory = JSON.parse(localStorage.getItem('delete-history') || '[]')
       const timestamp = Date.now()
-      
+
       itemsToDelete.forEach(item => {
         deleteHistory.unshift({
           path: item.path,
@@ -312,33 +347,43 @@ function App() {
           deleted_at_readable: new Date(timestamp).toLocaleString('zh-CN')
         })
       })
-      
+
       // 只保留最近 100 条删除记录
       if (deleteHistory.length > 100) {
         deleteHistory.splice(100)
       }
-      
+
       localStorage.setItem('delete-history', JSON.stringify(deleteHistory))
-      
+
       // 清空选中项
       setSelectedItems(new Set())
-      
+
       // 关闭确认对话框
       setShowDeleteConfirm(false)
-      
-      // 清除当前目录缓存并立即刷新
-      setScanCache(prev => {
-        const newCache = { ...prev }
-        delete newCache[currentPath]
-        return newCache
-      })
-      
-      // 立即重新扫描
-      await startScan('fast', true)
-      
+
       // 显示成功提示
       showToast(`✅ 已移到废纸篓！共 ${itemsToDelete.length} 项，可随时恢复`, 'success')
+
+      // 🚀 优化：删除成功后延迟重新扫描，避免阻塞UI
+      setTimeout(async () => {
+        try {
+          // 清除当前目录缓存
+          setScanCache(prev => {
+            const newCache = { ...prev }
+            delete newCache[currentPath]
+            return newCache
+          })
+
+          // 重新扫描（非阻塞）
+          await startScan('fast', true)
+        } catch (scanError) {
+          console.warn('重新扫描失败:', scanError)
+          // 扫描失败不影响删除成功的结果
+        }
+      }, 500) // 延迟500ms重新扫描
+
     } catch (error) {
+      console.error('删除操作失败:', error)
       setShowDeleteConfirm(false)
       showToast(`❌ 移到废纸篓失败: ${error}`, 'error')
     }
@@ -397,8 +442,8 @@ function App() {
       {/* Toast 提示 */}
       {toast.show && (
         <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[60] px-6 py-3 rounded-xl shadow-2xl flex items-center gap-3 animate-slide-down ${
-          toast.type === 'success' 
-            ? 'bg-gradient-to-r from-green-500 to-emerald-600' 
+          toast.type === 'success'
+            ? 'bg-gradient-to-r from-green-500 to-emerald-600'
             : 'bg-gradient-to-r from-red-500 to-orange-600'
         }`}
         style={{
@@ -406,6 +451,38 @@ function App() {
         }}>
           <span className="text-xl">{toast.type === 'success' ? '✅' : '❌'}</span>
           <span className="text-white font-semibold">{toast.message}</span>
+        </div>
+      )}
+
+      {/* 删除进度条 */}
+      {deleteProgress.show && (
+        <div className="fixed top-20 left-1/2 transform -translate-x-1/2 z-[60] bg-black/80 backdrop-blur-md rounded-xl p-6 shadow-2xl min-w-[400px]">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="w-8 h-8 bg-red-500/20 rounded-full flex items-center justify-center">
+              <span className="text-lg">🗑️</span>
+            </div>
+            <div className="flex-1">
+              <h3 className="text-white font-bold">正在删除文件</h3>
+              <p className="text-gray-300 text-sm">
+                {deleteProgress.current} / {deleteProgress.total} 项
+              </p>
+            </div>
+          </div>
+
+          {/* 进度条 */}
+          <div className="w-full bg-white/10 rounded-full h-2 mb-3 overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-red-500 to-orange-500 transition-all duration-300 ease-out"
+              style={{ width: `${deleteProgress.percent}%` }}
+            ></div>
+          </div>
+
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-gray-400">{Math.round(deleteProgress.percent)}%</span>
+            <span className="text-white truncate max-w-[200px]" title={deleteProgress.currentItem}>
+              {deleteProgress.currentItem}
+            </span>
+          </div>
         </div>
       )}
       
